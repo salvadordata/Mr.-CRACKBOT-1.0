@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <SD.h>
