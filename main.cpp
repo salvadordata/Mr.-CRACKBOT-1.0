@@ -215,12 +215,12 @@ void showIntroAnimation() {
   delay(3000);
 }
 
-// Function to display an image from SD card and optionally fill the screen
 void showImage(const char *filename, bool fillScreen) {
-  if (!SD.begin()) {
-    tft.println("SD Card initialization failed.");
-    return;
-  }
+    if (!SD.begin()) {
+        tft.println("SD Card initialization failed.");
+        return;
+    }
+}
 
   File jpgFile = SD.open(filename);
   if (!jpgFile) {
